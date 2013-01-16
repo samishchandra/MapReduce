@@ -1,0 +1,151 @@
+# @PydevCodeAnalysisIgnore
+'''
+Created on Nov 14, 2012
+
+@author: KSC
+'''
+
+from genericpath import exists
+from collections import defaultdict
+import time
+
+from distalgo.runtime.util import createprocs
+
+dist_source(".", "MapReduce.da")
+from MapReduce import Master
+from MapReduce import MapWorker
+from MapReduce import ReduceWorker
+
+from Utils import Utils
+from KeyValueType import KeyValueType
+from KeyValueType import KeyValue
+
+def DefaultPartitioner(n):
+    '''
+    Default Partitioner function
+    Partiion based on hash modulo
+    '''
+    return lambda kv: (hash(kv) % n)
+
+
+#===============================================================================
+# MapReduce API
+#===============================================================================
+
+class MapReduceAPI():
+    '''
+    API to run execute MapReduce framework
+    '''
+    
+    
+    def __init__():
+        '''
+        Declare the configuration parameters
+        '''
+        
+        # intialize to default values
+        self.inputFile = None
+        self.inputSplitSize = 3
+        self.noOfMapWorkers = 2
+        self.noOfReduceWorkers = 2
+        self.mapFunc = None
+        self.reduceFunc = None
+        # DefaultPartitioner can be used if partition function is not provided by the user
+        self.partitionerFunc = None
+        self.combinerFunc = None
+        self.workerTimeout = 6  # seconds
+        self.skipBadRecords = False
+        self.orderingGaurantee = False
+        self.debugFlag = False
+    
+    def execute():
+        
+        # sanitary checks
+        
+        # if inputFile is not specified
+        if(not self.inputFile):
+            raise RuntimeError("inputFile is not set")
+            return
+        
+        # if mapFunc function is not provided
+        if(not self.mapFunc):
+            raise RuntimeError("mapFunc not set")
+            return
+        
+        # if reduceFunc function is not provided
+        if(not self.reduceFunc):
+            raise RuntimeError("reduceFunc not set")
+        
+        # if the parameters are wrongly set
+        if(self.noOfMapWorkers <= 0 or self.noOfReduceWorkers <= 0 or self.workerTimeout <=2):
+            print("one of these parameters wrongly set noOfMapWorkers, noOfReduceWorkers, workerTimeout")
+            return
+        
+        # if partitioner function is not provided
+        if(not self.partitionerFunc):
+            print("Warning!! partitionFunc not set, setting to DefaultPartitioner")
+            self.partitionerFunc = DefaultPartitioner(self.noOfReduceWorkers)
+        
+        use_channel("tcp")
+    
+        if(not exists(self.inputFile)):
+            raise IOError(self.inputFile & " not found")
+            return
+    
+        # input file is split in to number of splits and each split is processed by a Mapper worker
+        inputSplits = Utils.getInputSplits(self.inputFile, self.inputSplitSize)
+    
+    
+        # setup map workers
+        kvType = KeyValueType(str, int)
+        mapOutputDir = './MapOutput/'
+        
+        # map workers for executing the Map task
+        mapWorkers = createprocs(MapWorker, self.noOfMapWorkers)
+        # call setup procs for map workers
+        for mapWorker in mapWorkers:
+            setupprocs([mapWorker], [kvType, self.mapFunc, mapOutputDir, self.partitionerFunc, self.combinerFunc, self.skipBadRecords])
+    
+        
+        # setup reduce workers
+        kvType = KeyValueType(str, int)
+        reduceOutputDir = './ReduceOutput/'
+    
+        # reduce workers for executing the Reduce task
+        reduceWorkers = createprocs(ReduceWorker, self.noOfReduceWorkers)
+        # call setup procs for reduce workers
+        for reduceWorker in reduceWorkers:
+            setupprocs([reduceWorker], [kvType, self.reduceFunc, reduceOutputDir, self.skipBadRecords, self.orderingGaurantee])
+    
+    
+        #setup master
+        
+        # master node for executing the MapReduce framework
+        master = createprocs(Master, 1)
+        # call setup procs for master
+        setupprocs(master, [mapWorkers, reduceWorkers, inputSplits, self.workerTimeout, self.debugFlag])
+    
+        
+        # delete previous output files
+        import glob
+        for filepath in glob.glob(mapOutputDir + '*.txt'):
+            glob.os.remove(filepath)
+        
+        for filepath in glob.glob(reduceOutputDir + '*.txt'):
+            glob.os.remove(filepath)
+        
+    
+        # start all the nodes
+        startprocs(mapWorkers)
+        startprocs(master)
+        startprocs(reduceWorkers)
+    
+        # wait for master to join
+        for m in master:
+            m.join()
+ 
+ 
+    
+    
+    
+

@@ -1,0 +1,11 @@
+An operating system (OS) is a collection of software that manages computer hardware resources and provides 
+common services for computer programs. The operating system is a vital component of the system software in a computer system. 
+Application programs require an operating system to function.
+
+Time-sharing operating systems schedule tasks for efficient use of the system and may also include 
+accounting for cost allocation of processor time, mass storage, printing, and other resources.
+
+For hardware functions such as input and output and memory allocation, the operating system acts as an 
+intermediary between programs and the computer hardware,[1][2] although the application code is usually 
+executed directly by the hardware and will frequently make a system call to an OS function or be interrupted by it. 
+Operating systems can be found on almost any device that contains a computer—from cellular phones and video game consoles to supercomputers and web servers.

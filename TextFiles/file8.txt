@@ -1,0 +1,16 @@
+In logic, a consistent theory is one that does not contain a contradiction.[1] 
+The lack of contradiction can be defined in either semantic or syntactic terms. 
+The semantic definition states that a theory is consistent if and only if it has a model, 
+i.e. there exists an interpretation under which all formulas in the theory are true. 
+This is the sense used in traditional Aristotelian logic, although in contemporary 
+mathematical logic the term satisfiable is used instead. The syntactic definition states that 
+a theory is consistent if and only if there is no formula P such that both P and its negation are provable from the 
+axioms of the theory under its associated deductive system.
+
+If these semantic and syntactic definitions are equivalent for a particular logic, the logic is complete.
+
+[clarification needed][citation needed] The completeness of sentential calculus was proved by 
+Paul Bernays in 1918[citation needed][2] and Emil Post in 1921,[3] while the completeness of predicate calculus 
+was proved by Kurt Gödel in 1930,[4] and consistency proofs for arithmetics restricted with respect to the induction 
+axiom schema were proved by Ackermann (1924), von Neumann (1927) and Herbrand (1931).[5] 
+Stronger logics, such as second-order logic, are not complete.

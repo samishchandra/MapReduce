@@ -1,0 +1,6 @@
+A diagram showing the structure of DNA, with detail showing the structure of the four bases: 
+adenine, cytosine, guanine and thymine, and the location of the major and minor groove. 
+Along with RNA and proteins, DNA is one of the three major macromolecules that are essential for 
+all known forms of life. Most DNA molecules are double-stranded helices, consisting of two 
+long polymers of simple units called nucleotides, molecules with backbones made of 
+alternating sugars (deoxyribose) and phosphate groups, with the bases attached to the sugars.

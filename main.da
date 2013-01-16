@@ -1,0 +1,157 @@
+# @PydevCodeAnalysisIgnore
+'''
+Created on Nov 14, 2012
+
+@author: KSC
+'''
+
+from genericpath import exists
+from collections import defaultdict
+import time
+
+from distalgo.runtime.util import createprocs
+dist_source(".", "MapReduce.da")
+from MapReduce import Master
+from MapReduce import MapWorker
+from MapReduce import ReduceWorker
+
+from Utils import Utils
+from KeyValueType import KeyValueType
+from KeyValueType import KeyValue
+
+#===============================================================================
+# Main functions
+#===============================================================================
+
+debugFlag = True
+
+def Counter(input):
+    '''
+    User Map function
+    Sanitize the string and report (word, count) for each word
+    '''
+    filename = input
+    output = list()
+    
+    import string
+    TT = ''.maketrans(string.punctuation, ' ' * len(string.punctuation))  # Translation Table
+
+    print('<MapFunc> Counter: Reading', str(filename))
+
+    with open(filename, 'rt') as f:
+        for line in f:
+            line = line.translate(TT)  # strip punctuation
+            for word in line.split():
+                word = word.lower()
+                output.append((word, 1))
+    
+    return output
+
+
+def Adder(input):
+    '''
+    User Reduce function
+    Add all the values for a key
+    '''
+    (key, values) = input
+#    print('<ReduceFunc> Adder: Reducing', str(key))
+    return (key, sum(values))
+
+
+def ModuloFirstLetter(kv):
+    '''
+    User Partition function
+    Partition mapped values by their key
+    '''
+    (key, value) = kv
+    return (ord(key[0]) % 4)
+
+
+def DefaultPartitioner(kv):
+    '''
+    Default Partitioner function
+    Partiion based on hash modulo
+    '''
+    return (hash(kv) % 4)
+
+def main():
+
+    # Configuration parameters
+    inputFile = str(sys.argv[1]) if len(sys.argv) > 1 else "./inputFile.txt"
+    inputSplitSize = int(sys.argv[2]) if len(sys.argv) > 1 else 3
+    noOfMapWorkers = int(sys.argv[3]) if len(sys.argv) > 1 else 2
+    noOfReduceWorkers = int(sys.argv[4]) if len(sys.argv) > 1 else 2
+    mapFunc = Counter
+    reduceFunc = Adder
+    # DefaultPartitioner can be used if partition function is not provided by the user
+    partitionerFunc = ModuloFirstLetter
+    combinerFunc = Adder
+    workerTimeout = 6  # seconds
+    skipBadRecords = False
+    orderingGaurantee = False
+    
+    # if partitioner function is not provided
+    if(not partitionerFunc): partitionerFunc = DefaultPartitioner
+    
+    use_channel("tcp")
+
+    if(not exists(inputFile)):
+        raise IOError(inputFile & " not found")
+        return
+
+    # input file is split in to number of splits and each split is processed by a Mapper worker
+    inputSplits = Utils.getInputSplits(inputFile, inputSplitSize)
+
+
+    # setup map workers
+    kvType = KeyValueType(str, int)
+    mapOutputDir = './MapOutput/'
+    
+    # map workers for executing the Map task
+    mapWorkers = createprocs(MapWorker, noOfMapWorkers)
+    # call setup procs for map workers
+    for mapWorker in mapWorkers:
+        setupprocs([mapWorker], [kvType, mapFunc, mapOutputDir, partitionerFunc, combinerFunc, skipBadRecords])
+
+    
+    # setup reduce workers
+    kvType = KeyValueType(str, int)
+    reduceOutputDir = './ReduceOutput/'
+
+    # reduce workers for executing the Reduce task
+    reduceWorkers = createprocs(ReduceWorker, noOfReduceWorkers)
+    # call setup procs for reduce workers
+    for reduceWorker in reduceWorkers:
+        setupprocs([reduceWorker], [kvType, reduceFunc, reduceOutputDir, skipBadRecords, orderingGaurantee])
+
+
+    #setup master
+    
+    # master node for executing the MapReduce framework
+    master = createprocs(Master, 1)
+    # call setup procs for master
+    setupprocs(master, [mapWorkers, reduceWorkers, inputSplits, workerTimeout, debugFlag])
+
+    
+    # delete previous output files
+    import glob
+    for filepath in glob.glob(mapOutputDir + '*.txt'):
+        glob.os.remove(filepath)
+    
+    for filepath in glob.glob(reduceOutputDir + '*.txt'):
+        glob.os.remove(filepath)
+    
+
+    # start all the nodes
+    startprocs(mapWorkers)
+    startprocs(master)
+    startprocs(reduceWorkers)
+
+    # wait for master to join
+    for m in master:
+        m.join()
+ 
+ 
+    
+    
+    

@@ -1,0 +1,840 @@
+# @PydevCodeAnalysisIgnore
+'''
+Created on Nov 14, 2012
+
+@author: KSC
+'''
+
+import datetime
+from distalgo.runtime.util import createprocs
+from genericpath import exists
+from collections import defaultdict
+import pickle
+import time
+
+from Utils import Utils
+
+# used for testing fault tolerance
+testFaultTolerance = False
+
+class InputMetaData():
+    '''
+    Stores the metadata information of the splits
+    '''
+    inputData = list() # actual input Data
+    isAssigned = False # to check if the split is assigned to a worker
+    isProcessedBy = None # stores the worker which processed the split
+    countFuncCalls = 0 # no of function calls required for split
+    countSkippedRecords = 0 # no of skipped records in the split
+    
+    def __init__(inputData):
+        '''
+        Constructor to set the initial values of the attributes and store inputData
+        '''
+        self.inputData = inputData
+        self.isAssigned = False
+        self.isProcessedBy = None
+        self.countFuncCalls = 0
+        self.countSkippedRecords = 0
+
+
+class WorkerMetaData():
+    '''
+    Stores the metadata information of the worker
+    '''
+    inputSplit = None # input split assigned the worker
+    isIdle = True # to check if the worker is in idle state
+    isAlive = True # to check the liveness of the worker
+    lastRepliedTime = None # last replied time of the worker
+    lastPingedTime = None # last pinged time of the worker
+    outputFiles = None # list of outputFiles used by the worker to store the output
+    
+    
+    def __init__(inputSplit=list(), outputFiles=list()):
+        '''
+        Constructor to set the initial values of the attributes and store inputSplit
+        '''
+        self.inputSplit = inputSplit
+        self.isIdle = True
+        self.isAlive = True
+        self.lastRepliedTime = time.time()
+        self.lastPingedTime = time.time()
+        self.outputFiles = outputFiles
+
+
+
+#===============================================================================
+# Master
+#===============================================================================
+class Master(DistProcess):
+    '''
+    Master process class
+    '''
+    # setup for the master node
+    
+    def setup(mWorkers, rWorkers, iSplits, workerTimeout, debugFlag):
+        '''
+        Initial setup method for process
+        mWorkers - set of mapper workers
+        rWorkers - set of reduce workers
+        iSplits - list of inputSplits
+        workerTimeout - time in seconds denoting the maximum allowed response time for a worker
+        '''
+
+        inputSplits = list()
+        for isplit in iSplits:
+            inputSplits.append(InputMetaData(isplit))  # inputData
+        
+        mapWorkers = defaultdict()
+        for mWorker in mWorkers:
+            mapWorkers[mWorker] = WorkerMetaData(list(), defaultdict(list)) # for map workers outputFiles is a dictionary
+
+        reduceWorkers = defaultdict()
+        for rWorker in rWorkers:
+            reduceWorkers[rWorker] = WorkerMetaData(list(), list()) # for reduce workers outputFiles is a list
+        
+        partitionSplits = list()
+        self.workerTimeout = workerTimeout
+        
+        self.debugFlag = debugFlag        
+        
+    def main():
+        '''
+        Main method invoked when process starts, represents the main flow of execution
+        '''
+        myPrint("***** Master *****")
+        myPrint("Input Splits: %s " % (str([inputSplit.inputData for inputSplit in inputSplits])))
+        
+        startTime = time.time()
+        #===============================================================
+        # Map Step
+        #===============================================================
+        
+        # assign a mapWorker for each of the input splits
+        initialSplitsAssignmentToWorkers(inputSplits, mapWorkers)
+        
+        pingFreq = int(workerTimeout/3)
+        lastPingedTime = time.time()
+        # wait for all the inputSplits to be processed
+#        await(all(inputSplit.isProcessedBy for inputSplit in inputSplits))
+        while(any(not inputSplit.isProcessedBy for inputSplit in inputSplits)):
+            --ReceiveResults
+            currentTime = time.time()
+            if((int(currentTime - lastPingedTime) >= pingFreq)):
+                --pingAndCheckWorkers
+                pingAndCheckWorkers(mapWorkers, currentTime)
+                lastPingedTime = currentTime
+
+                
+
+        if(not all(inputSplit.isProcessedBy for inputSplit in inputSplits)):
+            raise RuntimeError('all inputSplits are not processed')
+        
+        
+        # send exit command to all the map workers
+        send(ExitCommand(), mapWorkers.keys())
+        
+        
+        mapOutputFiles = list()
+        for mapWorker in mapWorkers.keys():
+            mapOutputFiles.extend(mapWorkers[mapWorker].outputFiles.values())
+        
+        myPrint('Map output files: %s' % mapOutputFiles)
+        myPrint("********* Map step completed *********")
+        
+        listKeyValue = Utils.loadFromFiles(mapOutputFiles, 'rb')
+        if(debugFlag):
+            totalMapValues = sum(v for (k, v) in listKeyValue)
+            myPrint(totalMapValues)
+        myPrint(listKeyValue)
+
+        #===============================================================
+        # Grouping the partition output files
+        #===============================================================
+        
+        # All the map workers have the same key for the same partition since every map worker use the same Partition function
+        partitionOuputFiles = defaultdict(list)
+        for mapWorker in mapWorkers.keys():
+            for partitionKey in mapWorkers[mapWorker].outputFiles.keys():
+                partitionOuputFiles[partitionKey].append(mapWorkers[mapWorker].outputFiles[partitionKey])
+        
+        myPrint('Grouped partition files: %s' % partitionOuputFiles)
+        
+        # create the partition splits
+        for key in partitionOuputFiles.keys():
+            partitionSplits.append(InputMetaData(partitionOuputFiles[key]))  # inputData
+        
+        
+        #===============================================================
+        # Reduce Step
+        #===============================================================
+        
+        # assign a reduceWorker for each of the partition splits
+        initialSplitsAssignmentToWorkers(partitionSplits, reduceWorkers)
+        
+        pingFreq = int(workerTimeout/3)
+        lastPingedTime = time.time()
+        # wait for all the partitionSplits to be processed
+        # await(all(partitionSplit.isProcessedBy for partitionSplit in partitionSplits))
+        while(any(not partitionSplit.isProcessedBy for partitionSplit in partitionSplits)):
+            --ReceiveResults
+            currentTime = time.time()
+            if((int(currentTime - lastPingedTime) >= pingFreq)):
+                --pingAndCheckWorkers
+                pingAndCheckWorkers(reduceWorkers, currentTime)
+                lastPingedTime = currentTime
+        
+        
+        # send exit command to all the workers
+        send(ExitCommand(), reduceWorkers.keys())
+        
+        reduceOutputFiles = list()
+        for reduceWorker in reduceWorkers.keys():
+            reduceOutputFiles.extend(reduceWorkers[reduceWorker].outputFiles)
+        
+        
+        myPrint('Reduce output files: %s' % reduceOutputFiles)
+        myPrint("********* Reduce step completed *********")
+                
+        
+        listKeyValue = Utils.loadFromFiles(reduceOutputFiles, 'rb')
+        if(debugFlag):
+            totalReduceValues = sum(v for (k, v) in listKeyValue)
+            myPrint(totalReduceValues)
+        myPrint(listKeyValue)
+        
+        if(debugFlag):
+            if(totalMapValues != totalReduceValues):
+                raise RuntimeError('outputs of Map and Reduce steps do not match')
+        
+        endTime = time.time()
+        getStats()
+        
+        --exit
+        myPrint("Master Exiting")
+    
+        # display stats
+        print('\n')
+        print('No of Mappers: %d' % len(mapWorkers))
+        print('No of Reducers: %d' % len(reduceWorkers))
+        print('No of Map tasks: %d' % noOfMapTasks())
+        print('No of Reduce tasks: %d' % noOfReduceTasks())
+        print('No of failed Map workers: %d' % noOfFailedMapWorkers())
+        print('No of failed Reduce workers: %d' % noOfFailedReduceWorkers())
+        print('No of Map function calls: %d' % noOfUserMapCalls())
+        print('No of Reduce function calls: %d' % noOfUserReduceCalls())
+        print('Total time elapsed: %.2fsec' % (endTime-startTime))
+    
+
+    def setIsAlive(toBeRemoved, workers):
+        '''
+        Function to set the attributes like isAlive etc. flags when a worker is removed
+        toBeRemoved - list of workers to be removed
+        workers - complete list of workers
+        '''
+        for worker in toBeRemoved:
+            myPrint("********* Removing the worker %s *********" % worker)
+            for inputSplit in inputSplits:
+                if(inputSplit.isProcessedBy == worker):
+                    inputSplit.isAssigned = False
+                    inputSplit.isProcessedBy = False
+            
+            workers[worker].inputSplit.isAssigned = False
+            workers[worker].inputSplit.isProcessedBy = False
+            workers[worker].isAlive = False
+    
+    
+    def pingAndCheckWorkers(workers, currentTime):
+        '''
+        Function to ping and check liveness of workers
+        workers - dictionary of workers
+        currentTime - time to be set a ping time
+        '''
+        #===============================================================
+        # FaultTolerance
+        #===============================================================
+        toBePinged = list()
+        toBeRemoved = list()
+        
+        for i in workers.keys():
+            if(workers[i].isAlive == True):
+                if(workers[i].lastRepliedTime >= workers[i].lastPingedTime):  
+                        toBePinged.append(i)
+                        workers[i].lastPingedTime = currentTime
+                else:
+                    if(int(currentTime - workers[i].lastRepliedTime) >= workerTimeout):
+                        toBeRemoved.append(i)
+        
+        --PingingWorkers
+        if(toBePinged):
+            myPrint("********* Pinging workers %s *********" % toBePinged)
+            send(Ping(currentTime), toBePinged)
+        
+        setIsAlive(toBeRemoved, workers)
+
+    
+    def initialSplitsAssignmentToWorkers(splits, workers):
+        '''
+        Initial method to assign splits to the workers
+        splits - list of splits to be assigned
+        workers - dictionary of workers
+        '''
+        for split in splits:
+            if(not split.isProcessedBy and not split.isAssigned):                
+                worker = getIdleWorker(workers)
+                if(worker):
+                    assignSplitToWorker(split, worker, workers[worker])
+                else:
+                    break  # no idle worker found
+    
+    
+    def assignSplitToWorker(split, worker, workerMetaData):
+        '''
+        Method to assign a split to worker and update the corresponding fields
+        split - split to be assigned
+        worker - worker to which split has be assigned
+        workerMetaData - worker meta data for the corresponding worker
+        '''
+        if(not split or not worker): return
+        
+        split.isAssigned = True
+        workerMetaData.inputSplit = split
+        workerMetaData.isIdle = False
+        
+        send(AssignWork(split.inputData), worker)
+        myPrint('Assigned split %s to %s' % (str(split.inputData), worker._address[1]))
+    
+    
+    def getUnProcessedSplit(splits):
+        '''
+        Get an unprocessed and unassigned split from the list of splits
+        splits - list of splits
+        '''
+        for split in splits:
+            if(not split.isProcessedBy and not split.isAssigned):
+                return split
+        
+        return None
+
+   
+    def getIdleWorker(workers):
+        '''
+        Get an idle worker from the set of workers
+        workers - dict of workers
+        '''
+        for worker in workers:
+            if(workers[worker].isIdle and workers[worker].isAlive == True):
+                return worker
+        
+        return None
+
+    def OnReportMapWork(outputFiles, countMapCalls, countSkippedRecords):
+        '''
+        Method invoked when work is reported from a map worker
+        '''
+
+        myPrint('MapWork reported from ' + str(_source))
+        
+        # set the isIdle flag for the mapWorker 
+        mapWorker = _source
+        
+        # set the common fields in corresponding WorkerMetaData
+        setWorkerMetaData(mapWorker, mapWorkers, countMapCalls, countSkippedRecords)
+        
+        # for map workers outputFiles is a dictionary
+        mapWorkers[mapWorker].outputFiles.update(outputFiles)
+        
+        # if any unprocessed inputSplit is present, assign it to the mapWorker
+        inputSplit = getUnProcessedSplit(inputSplits)
+        assignSplitToWorker(inputSplit, mapWorker, mapWorkers[mapWorker])
+
+    def OnReportReduceWork(outputFile, countReduceCalls, countSkippedRecords):
+        '''
+        Method invoked when work is reported from a reduce worker
+        '''
+        myPrint('ReduceWork reported from ' + str(_source))
+        
+        # set the isIdle flag for the mapWorker 
+        reduceWorker = _source
+        
+        # set the common fields in corresponding WorkerMetaData
+        setWorkerMetaData(reduceWorker, reduceWorkers, countReduceCalls, countSkippedRecords)
+        
+        # for reduce workers outputFiles is a dictionary
+        reduceWorkers[reduceWorker].outputFiles.append(outputFile) # for reduce workers outputFiles is a list
+        
+        # if any unprocessed partitionSplit is present, assign it to the reduceWorker
+        partitionSplit = getUnProcessedSplit(partitionSplits)
+        assignSplitToWorker(partitionSplit, reduceWorker, reduceWorkers[reduceWorker])
+    
+    
+    def setWorkerMetaData(worker, workers, countFuncCalls, countSkippedRecords):
+        '''
+        Helper method, used to modularize the code
+        '''
+        # update isProcessedBy, isAssigned flags for the corresponding inputSplit
+        workers[worker].inputSplit.isAssigned = False
+        workers[worker].inputSplit.isProcessedBy = worker
+        
+        # update the counters
+        workers[worker].inputSplit.countFuncCalls += countFuncCalls
+        workers[worker].inputSplit.countSkippedRecords += countSkippedRecords
+        workers[worker].inputSplit = None
+        
+        # set the isIdle flag so that Master picks them up and assign another split
+        workers[worker].isIdle = True
+        workers[worker].lastRepliedTime = time.time()
+    
+   
+    def OnMapPingResponse():
+        '''
+        Method invoked when ping is received from a map worker
+        '''
+        myPrint('Received mapper ping response from ' + str(_source))
+        mapWorkers[_source].lastRepliedTime = time.time()
+    
+    
+    def OnReducePingResponse():
+        '''
+        Method invoked when ping is received from a reduce worker
+        '''
+        myPrint('Received reducer ping response from ' + str(_source))
+        reduceWorkers[_source].lastRepliedTime = time.time()
+ 
+    def noOfMapTasks():
+        '''
+        Returns the total no of map tasks
+        '''
+        return len(inputSplits)
+
+    def noOfReduceTasks():
+        '''
+        Returns the total no of reduce tasks
+        '''
+        return len(partitionSplits)
+    
+    def noOfFailedMapWorkers():
+        '''
+        Returns the no of failed map workers
+        '''
+        return len([worker for worker in mapWorkers if(mapWorkers[worker].isAlive==False)])
+    
+    def noOfFailedReduceWorkers():
+        '''
+        Returns the no of failed reduce workers
+        '''
+        return len([worker for worker in reduceWorkers if(reduceWorkers[worker].isAlive==False)])
+    
+    def noOfUserMapCalls():
+        '''
+        Returns the no of calls to user map function
+        '''
+        return sum([split.countFuncCalls for split in inputSplits if(split.isProcessedBy != None)])
+    
+    def noOfUserReduceCalls():
+        '''
+        Returns the no of calls to user reduce function
+        '''
+
+        return sum([split.countFuncCalls for split in partitionSplits if(split.isProcessedBy != True)])
+    
+    
+    def getStats():
+        '''
+        Returns the tuple of counters/stats
+        '''
+        return (
+                noOfMapTasks(),
+                noOfReduceTasks(),
+                noOfFailedMapWorkers(),
+                noOfFailedReduceWorkers(),
+                noOfUserMapCalls(),
+                noOfUserReduceCalls()
+               )
+    
+    def myPrint(comment):
+        '''
+        Helper print function
+        used mainly for debugging purposes
+        '''
+        print(datetime.datetime.now().strftime("%H:%M:%S.%f"), "|", str(self._id._address[1]), "| Master  |", comment)
+        sys.stdout.flush()
+
+
+
+#===============================================================================
+# MapWorker
+#===============================================================================
+class MapWorker(DistProcess):
+    '''
+    Mapper process class
+    '''
+
+    def setup(kvType, mapFunc, outputDir, partitionerFunc, combinerFunc=None, skipBadRecords=False):
+        '''
+        Initial setup method for process
+        kvType - defines the data type of input splits
+        mapFunc - user Map function
+        outputDir - outputDir into which output files has to be written
+        partitionerFunc - user Parititioner function
+        combinerFunc - user Combiner function
+        skipBadRecords - boolean flag defining whether to skip bad records or not
+        '''
+        self.kvType = kvType
+        self.mapFunc = mapFunc
+        self.outputDir = outputDir
+        self.combinerFunc = combinerFunc
+        self.partitionerFunc = partitionerFunc
+        self.skipBadRecords = skipBadRecords
+        
+    def Map(inputData):
+        '''
+        Method to call the user Map function on each record in the assigned split
+        '''
+        countMapCalls = 0
+        countSkippedRecords = 0
+        
+        result = list()
+        
+        # call user defined Map funtion on the input splits
+        for input in inputData:
+            try:
+                result.extend(mapFunc(input))
+                countMapCalls += 1
+            except :
+                if(self.skipBadRecords):
+                    countSkippedRecords += 1
+                else:
+                    raise
+                
+        
+        #===============================================================
+        # Combiner Step
+        #===============================================================
+        if(combinerFunc):
+            # group the data based on key
+            partitionedData = defaultdict(list)
+            for key, value in result:
+                partitionedData[key].append(value)
+    
+            # call user Reduce funtion on the partition splits
+            result = list()
+            for key in partitionedData.keys():
+                result.append(combinerFunc((key, partitionedData[key])))
+        
+        return (result, countMapCalls, countSkippedRecords)
+    
+    def OnAssignWork(inputData):
+        '''
+        Method invoked when Master assigns work to this worker
+        '''
+        time.sleep(2)
+        myPrint("Received input split: " + str(inputData))
+        outputFile = outputDir + str(time.time()).replace('.', '') + '_output_' + str(self._id._address[1]) +'.txt'
+        
+        # actual Map execution
+        listKeyValue, countMapCalls, countSkippedRecords = Map(inputData)
+
+        
+        #===============================================================
+        # Partition Step
+        #===============================================================
+                
+        # partition step
+        partitions = partitioner(listKeyValue)
+        
+        # write partition to files
+        partitionOuputFiles = dict()
+        for key in partitions.keys():
+            outputFile = outputDir + str(self._id._address[1]) + '_output_' + str(key) + '.txt'
+            myPrint("writing result to " + outputFile)
+            # open the result file in append mode since, previously this worker might have written something
+            Utils.writeResult(partitions[key], outputFile, 'a+b')
+            partitionOuputFiles[key] = outputFile
+        
+#        writeResult(result, outputFile)
+        if((not testFaultTolerance) or (self._id._address[1] % 2  == 0)):
+            send(ReportMapWork(partitionOuputFiles, countMapCalls, countSkippedRecords), _source)
+
+    def partitioner(listKeyValue):
+        '''
+        Calls the user partitioner function on Map output and create paritions
+        '''
+        partitions = defaultdict(list)
+        for kv in listKeyValue:
+            partitionKey = partitionerFunc(kv)
+            partitions[partitionKey].append(kv)
+        
+        return partitions
+
+    def OnPing(currentTime):
+        '''
+        Invoked when Master process pings this worker
+        '''
+        myPrint("Pinged")
+        if((not testFaultTolerance) or (self._id._address[1] % 2  == 0)):
+            send(MapPingResponse(), _source)
+
+    def main():
+        '''
+        Main method invoked when the process starts
+        '''
+        myPrint("***** MapWorker *****")
+        
+        --ReceiveWork
+        await(received(ExitCommand()))
+        --exit
+        myPrint("MapWorker Exiting")
+
+    def myPrint(comment):
+        '''
+        Helper print function
+        used mainly for debugging purposes
+        '''
+        print(datetime.datetime.now().strftime("%H:%M:%S.%f"), "|", str(self._id._address[1]), "| Mapper  |", comment)
+        sys.stdout.flush()
+
+
+#===============================================================================
+# ReduceWorker
+#===============================================================================
+class ReduceWorker(DistProcess):
+    '''
+    Reducer process class
+    '''
+
+    def setup(kvType, reduceFunc, outputDir, skipBadRecords=False, orderingGaurantee = True):
+        '''
+        Initial setup method for process
+        kvType - defines the data type of input splits
+        reduceFunc - user Reduce function
+        outputDir - outputDir into which output files has to be written
+        skipBadRecords - boolean flag defining whether to skip bad records or not
+        orderingGaurantee - boolean flag defining whether output has to be ordered or not
+        '''
+
+        self.kvType = kvType
+        self.reduceFunc = reduceFunc
+        self.outputDir = outputDir
+        self.skipBadRecords = skipBadRecords
+        self.orderingGaurantee = orderingGaurantee
+    
+    def Reduce(partitionFiles):
+        '''
+        Method to call the user Reduce function on unique <key, list(values)>
+        '''
+        countReduceCalls = 0
+        countSkippedRecords = 0
+        
+        result = list()
+        
+        # unpickle the objects from the partition files
+        listKeyValue = Utils.loadFromFiles(partitionFiles, 'rb')
+        
+        # group the data based on key
+        partitionedData = defaultdict(list)
+        for key, value in listKeyValue:
+            partitionedData[key].append(value)
+        
+        #=======================================================================
+        # Ordering Gaurantees
+        #=======================================================================
+        if(self.orderingGaurantee):
+            listKeys = sorted(partitionedData.keys())
+        else:
+            listKeys = partitionedData.keys()
+
+        # call user defined Reduce funtion on the partition splits
+        for key in listKeys:
+            try:
+                result.append(reduceFunc((key, partitionedData[key])))
+                countReduceCalls += 1
+            except :
+                if(self.skipBadRecords):
+                    countSkippedRecords += 1
+                else:
+                    raise
+        
+        return (result, countReduceCalls, countSkippedRecords)
+    
+    def OnAssignWork(partitionFiles):
+        '''
+        Method invoked when Master assigns work to this process
+        '''
+        time.sleep(2)
+        myPrint("Received partition split files: " + str(partitionFiles))
+        outputFile = outputDir + str(time.time()).replace('.', '') + '_output_' + str(self._id._address[1]) +'.txt'
+        
+        result, countReduceCalls, countSkippedRecords = Reduce(partitionFiles)
+        myPrint("writing result to " + outputFile)
+        Utils.writeResult(result, outputFile, 'wb')
+        
+        if((not testFaultTolerance) or (self._id._address[1] % 3  == 0)):
+            send(ReportReduceWork(outputFile, countReduceCalls, countSkippedRecords), _source)
+    
+    def OnPing(currentTime):
+        '''
+        Method invoked when Master process pings this worker
+        '''
+        myPrint("Pinged")
+        if((not testFaultTolerance) or (self._id._address[1] % 3  == 0)):
+            send(ReducePingResponse(), _source)
+    
+    def main():
+        '''
+        Main method invoked when process starts
+        '''
+        myPrint("***** ReduceWorker *****")
+        
+        --ReceiveWork
+        await(received(ExitCommand()))
+        --exit
+        myPrint("ReduceWorker Exiting")
+
+    def myPrint(comment):
+        '''
+        Helper print function
+        used mainly for debugging purposes
+        '''
+        print(datetime.datetime.now().strftime("%H:%M:%S.%f"), "|", str(self._id._address[1]), "| Reducer |", comment)
+        sys.stdout.flush()
+
+
+
+#
+##===============================================================================
+## Main functions
+##===============================================================================
+#
+#
+#
+#def Counter(input):
+#    '''
+#    User Map function
+#    Sanitize the string and report (word, count) for each word
+#    '''
+#    filename = input
+#    output = list()
+#    
+#    import string
+#    TT = ''.maketrans(string.punctuation, ' ' * len(string.punctuation))  # Translation Table
+#
+#    print('<MapFunc> Counter: Reading', str(filename))
+#
+#    with open(filename, 'rt') as f:
+#        for line in f:
+#            line = line.translate(TT)  # strip punctuation
+#            for word in line.split():
+#                word = word.lower()
+#                output.append((word, 1))
+#    
+#    return output
+#
+#
+#def Adder(input):
+#    '''
+#    User Reduce function
+#    Add all the values for a key
+#    '''
+#    (key, values) = input
+##    print('<ReduceFunc> Adder: Reducing', str(key))
+#    return (key, sum(values))
+#
+#
+#def ModuloFirstLetter(kv):
+#    '''
+#    User Partition function
+#    Partition mapped values by their key
+#    '''
+#    (key, value) = kv
+#    return (ord(key[0]) % 4)
+#
+#
+#def DefaultPartitioner(kv, n):
+#    '''
+#    Default Partitioner function
+#    Partiion based on hash modulo
+#    '''
+#    return (hash(kv) % 4)
+#
+#def main():
+#
+#    # Configuration parameters
+#    inputFile = str(sys.argv[1]) if len(sys.argv) > 1 else "./inputFile.txt"
+#    inputSplitSize = int(sys.argv[2]) if len(sys.argv) > 1 else 3
+#    noOfMapWorkers = int(sys.argv[3]) if len(sys.argv) > 1 else 2
+#    noOfReduceWorkers = int(sys.argv[4]) if len(sys.argv) > 1 else 2
+#    mapFunc = Counter
+#    reduceFunc = Adder
+#    # DefaultPartitioner can be used if partition function is not provided by the user
+#    partitionerFunc = ModuloFirstLetter
+#    combinerFunc = Adder
+#    workerTimeout = 6  # seconds
+#    skipBadRecords = False
+#    orderingGaurantee = False
+#    
+#    # if partitioner function is not provided
+#    if(not partitionerFunc): partitionerFunc = DefaultPartitioner
+#    
+#    use_channel("tcp")
+#
+#    if(not exists(inputFile)):
+#        raise IOError(inputFile & " not found")
+#        return
+#
+#    # input file is split in to number of splits and each split is processed by a Mapper worker
+#    inputSplits = Utils.getInputSplits(inputFile, inputSplitSize)
+#
+#
+#    # setup map workers
+#    kvType = KeyValueType(str, int)
+#    mapOutputDir = './MapOutput/'
+#    
+#    # map workers for executing the Map task
+#    mapWorkers = createprocs(MapWorker, noOfMapWorkers)
+#    # call setup procs for map workers
+#    for mapWorker in mapWorkers:
+#        setupprocs([mapWorker], [kvType, mapFunc, mapOutputDir, partitionerFunc, combinerFunc, skipBadRecords])
+#
+#    
+#    # setup reduce workers
+#    kvType = KeyValueType(str, int)
+#    reduceOutputDir = './ReduceOutput/'
+#
+#    # reduce workers for executing the Reduce task
+#    reduceWorkers = createprocs(ReduceWorker, noOfReduceWorkers)
+#    # call setup procs for reduce workers
+#    for reduceWorker in reduceWorkers:
+#        setupprocs([reduceWorker], [kvType, reduceFunc, reduceOutputDir, skipBadRecords, orderingGaurantee])
+#
+#
+#    #setup master
+#    
+#    # master node for executing the MapReduce framework
+#    master = createprocs(Master, 1)
+#    # call setup procs for master
+#    setupprocs(master, [mapWorkers, reduceWorkers, inputSplits, workerTimeout])
+#
+#    
+#    # delete previous output files
+#    import glob
+#    for filepath in glob.glob(mapOutputDir + '*.txt'):
+#        glob.os.remove(filepath)
+#    
+#    for filepath in glob.glob(reduceOutputDir + '*.txt'):
+#        glob.os.remove(filepath)
+#    
+#
+#    # start all the nodes
+#    startprocs(mapWorkers)
+#    startprocs(master)
+#    startprocs(reduceWorkers)
+#
+#    # wait for master to join
+#    for m in master:
+#        m.join()
+# 
+# 
+#    
+#    
+#    

@@ -1,0 +1,415 @@
+# @PydevCodeAnalysisIgnore
+'''
+Created on Nov 14, 2012
+
+@author: KSC
+'''
+
+import datetime
+from distalgo.runtime.util import createprocs
+from genericpath import exists
+from collections import defaultdict
+import pickle
+
+
+class KeyValueType():
+    """
+    Class used for the defining the type of input to the MapReduce API
+    """
+    keyType = None
+    valueType = None
+
+    def __init__(keyType, valueType):
+        self.keyType = keyType
+        self.valueType = valueType
+
+class KeyValue():
+    
+    def __init__(kvType):
+        self.key = kvType.keyType()
+        self.value = kvType.value()
+
+
+class InputMetaData():
+    inputData = list()
+    isAssigned = False
+    isProcessed = False
+
+    def __init__(inputData, isAssigned, isProcessed):
+        self.inputData = inputData
+        self.isAssigned = isAssigned
+        self.isProcessed = isProcessed
+
+
+class WorkerMetaData():
+    isIdle = True
+    inputSplit = None
+    
+    def __init__(isIdle, inputSplit):
+        self.isIdle = isIdle
+        self.inputSplit = inputSplit
+
+
+#===============================================================================
+# Master
+#===============================================================================
+class Master(DistProcess):
+    
+    # setup for the master node
+    def setup(mWorkers, rWorkers, iSplits, partitionerFunc):
+
+        inputSplits = list()
+        for isplit in iSplits:
+            inputSplits.append(InputMetaData(isplit, False, False))  # inputData, isAssigned, isProcessed
+        
+        mapWorkers = defaultdict()
+        for mWorker in mWorkers:
+            mapWorkers[mWorker] = WorkerMetaData(True, None)
+
+        reduceWorkers = defaultdict()
+        for rWorker in rWorkers:
+            reduceWorkers[rWorker] = WorkerMetaData(True, None)
+
+        self.partitionerFunc = partitionerFunc
+        mapOutputFiles = list()
+        reduceOutputFiles = list()
+
+
+    def main():
+        myPrint("***** Master *****")
+        myPrint("Input Splits: %s " % (str([inputSplit.inputData for inputSplit in inputSplits])))
+        
+        # assign a mapWorker for each of the input splits
+        initialSplitsAssignmentToWorkers(inputSplits, mapWorkers)
+        
+        # wait for all the inputSplits to be processed
+        -- ReceiveResults
+        await(all(inputSplit.isProcessed for inputSplit in inputSplits))
+        
+        # send exit command to all the workers
+        send(ExitCommand(), mapWorkers.keys())
+        
+        
+        myPrint('Map output files: %s' % mapOutputFiles)
+        myPrint("********* Mapp step completed*********")
+
+        listKeyValue = list()
+        for file in mapOutputFiles:
+            with open(file, 'rb') as f:
+                 listKeyValue.extend(pickle.load(f))
+        myPrint(listKeyValue)
+        
+        # partition step
+        partitions = defaultdict()
+        for kv in listKeyValue:
+            partitionKey = partitionerFunc(kv)
+            if(not partitionKey in partitions.keys()):
+                partitions[partitionKey] = list()
+            partitions[partitionKey].append(kv)
+        
+        myPrint(sum(([len(partitions[key]) for key in partitions.keys()])))
+        myPrint(len(listKeyValue))
+        
+        partitionOuputFiles = list()
+        partitionOutputDir = './PartitionOutput/'
+        for i in range(len(partitions.keys())):
+            outputFile = partitionOutputDir + 'output_' + str(i) + '.txt'
+            print(outputFile)
+            writePartition(partitions[i], outputFile)
+            partitionOuputFiles.append(outputFile)
+        
+        myPrint('Partition output files: %s' % partitionOuputFiles)
+        myPrint("********* Partition step completed *********")
+        
+        
+        listKeyValue = list()
+        for file in partitionOuputFiles:
+            with open(file, 'rb') as f:
+                 listKeyValue.extend(pickle.load(f))
+        myPrint(listKeyValue)
+        
+        
+        # reduce step
+        partitionSplits = list()
+        for outputFile in partitionOuputFiles:
+            partitionSplits.append(InputMetaData(outputFile, False, False))  # inputData, isAssigned, isProcessed
+        
+        
+        # assign a reduceWorker for each of the partition splits
+        initialSplitsAssignmentToWorkers(partitionSplits, reduceWorkers)
+        
+        
+#        # wait for all the partitionSplits to be processed
+#        -- ReceiveResults
+#        await(all(partitionSplit.isProcessed for partitionSplit in partitionSplits))
+#        
+#        # send exit command to all the workers
+#        send(ExitCommand(), reduceWorkers.keys())
+#        
+#        
+#        myPrint('Reduce output files: %s' % reduceOutputFiles)
+#        myPrint("********* Reduce step completed *********")
+#
+#
+#        listKeyValue = list()
+#        for file in reduceOutputFiles:
+#            with open(file, 'rb') as f:
+#                 listKeyValue.extend(pickle.load(f))
+#        myPrint(listKeyValue)
+
+
+        -- exit
+        myPrint("Master Exiting")
+    
+    def writePartition(partition, outputFile):
+        myPrint("writing partition to " + outputFile)
+        fptr = open(outputFile, 'wb')
+        pickle.dump(partition, fptr)
+        fptr.close()
+    
+    def initialSplitsAssignmentToWorkers(splits, workers):
+        for split in splits:
+            if(not split.isProcessed and not split.isAssigned):                
+                worker = getIdleWorker(workers)
+                if(worker):
+                    assignSplitToWorker(split, worker, workers[worker])
+                else:
+                    break # no idle worker found
+    
+    def assignSplitToWorker(split, worker, workerMetaData):
+        if(not split or not worker): return
+        
+        split.isAssigned = True
+        workerMetaData.inputSplit = split
+        workerMetaData.isIdle = False
+        
+        send(AssignWork(split.inputData), worker)
+        myPrint('Assigned input split %s to %s' % (str(split.inputData), str(worker._address[1])))
+    
+    def getUnProcessedSplit(splits):
+        for split in splits:
+            if(not split.isProcessed and not split.isAssigned):
+                return split
+        
+        return None
+
+    def getIdleWorker(workers):
+        for worker in workers:
+            if(workers[worker].isIdle):
+                return worker
+        
+        return None
+
+    def OnReportMapWork(outputFile):
+        myPrint('MapWork reported from ' + str(_source))
+        mapOutputFiles.append(outputFile)
+        
+        # set the isIdle flag for the mapWorker 
+        mapWorker = _source
+        mapWorkers[mapWorker].isIdle = True
+        
+        
+        # set the isProcessed flag for the corresponding inputSplit
+        mapWorkers[mapWorker].inputSplit.isAssigned = False
+        mapWorkers[mapWorker].inputSplit.isProcessed = True
+        mapWorkers[mapWorker].inputSplit = None
+        
+        # if any unprocessed inputSplit is present, assign it to the mapWorker
+        inputSplit = getUnProcessedSplit(inputSplits)
+        assignSplitToWorker(inputSplit, mapWorker, mapWorkers[mapWorker])
+
+    def OnReportReduceWork(outputFile):
+        myPrint('ReduceWork reported from ' + str(_source))
+        reduceOutputFiles.append(outputFile)
+        
+        # set the isIdle flag for the mapWorker 
+        reduceWorker = _source
+        reduceWorkers[reduceWorker].isIdle = True
+        
+        
+        # set the isProcessed flag for the corresponding inputSplit
+        reduceWorker[reduceWorker].inputSplit.isAssigned = False
+        reduceWorker[reduceWorker].inputSplit.isProcessed = True
+        reduceWorker[reduceWorker].inputSplit = None
+        
+        # if any unprocessed partitionSplit is present, assign it to the reduceWorker
+        partitionSplit = getUnProcessedSplit(partitionSplits)
+        assignSplitToWorker(partitionSplit, reduceWorker, reduceWorker[reduceWorker])
+    
+    def OnReceive():
+        print('Receive a message')
+
+    def myPrint(comment):
+        print(datetime.datetime.now().strftime("%H:%M:%S.%f"), "|", str(self._id._address[1]), "|", comment)
+        sys.stdout.flush()
+
+
+
+#===============================================================================
+# Worker
+#===============================================================================
+class Worker(DistProcess):
+
+    def setup(kvType, func, outputDir):
+        self.kvType = kvType
+        self.func = func
+        self.outputDir = outputDir
+    
+    
+    def writeResult(result, outputFile):
+        myPrint("writing result to " + outputFile)
+        fptr = open(outputFile, 'wb')
+        pickle.dump(result, fptr)
+        fptr.close()
+
+    """
+    when receiving work from Master node
+    """
+    def OnAssignWork(inputData):
+        myPrint("Worker->OnAssignWork() called")
+    
+    def main():
+    	myPrint("***** MapWorker *****")
+        
+    	--ReceiveWork
+    	await(received(ExitCommand()))
+    	-- exit
+    	myPrint("MapWorker Exiting")
+
+    def myPrint(comment):
+        print(datetime.datetime.now().strftime("%H:%M:%S.%f"), "|", str(self._id._address[1]), "|", comment)
+        sys.stdout.flush()
+
+
+
+
+#===============================================================================
+# MapWorker
+#===============================================================================
+class MapWorker(Worker):
+    
+    def Map(inputData):
+           result = list()
+           # call user Map funtion on the input splits
+           for input in inputData:
+               result.extend(func(input))
+    
+           return result
+    
+    def Reduce(inputData):
+        result = list()
+        
+        # call user Reduce funtion on the partition splits
+        for input in inputData:
+            result.extend(func(input))
+    
+        return result
+    
+    """
+    when receiving work from Master node
+    """
+    def OnAssignWork(inputData):
+#        myPrint("Received work called from " + str(_source._address[1]))
+        myPrint("Received input split: " + str(inputData))
+        outputFile = outputDir + str(time.time()).replace('.', '') + '_output_' + '.txt'
+        
+        result = Map(inputData)
+        writeResult(result, outputFile)
+        send(ReportMapWork(outputFile), _source)
+
+
+#===============================================================================
+# Main functions
+#===============================================================================
+
+
+def getInputSplits(inputFile, inputSplitSize):
+    """
+    function to read and split the inputDataFile given by the user
+    """
+    inputData = [line.strip() for line in open(inputFile)]
+    inputSplits = []
+
+    for index in range(0, len(inputData), inputSplitSize):
+        inputSplits.append(inputData[index:index + inputSplitSize])
+
+    return inputSplits
+def Counter(input):
+    filename = input
+    output = list()
+    
+    import string
+    TT = ''.maketrans(string.punctuation, ' ' * len(string.punctuation)) # Translation Table
+
+    print('<MapFunc> Counter: Reading', filename)
+
+    with open(filename, 'rt') as f:
+        for line in f:
+            line = line.translate(TT)  # strip punctuation
+            for word in line.split():
+                word = word.lower()
+                output.append((word, 1))
+    
+    return output
+
+def Adder():
+    return 0
+
+"""
+Partition the mapped values by their key
+"""
+def ModuloFirstLetter(kv):
+    (key, value) = kv
+    return (ord(key[0]) % 4)
+
+def DefaultPartitioner(kv):
+    return (hash(kv) % 4)
+
+def main():
+
+    # Configuration parameters
+    inputFile = str(sys.argv[1]) if len(sys.argv) > 1 else "./inputFile.txt"
+    inputSplitSize = int(sys.argv[2]) if len(sys.argv) > 1 else 3
+    nMapWorkers = int(sys.argv[3]) if len(sys.argv) > 1 else 2
+    nReduceWorkers = int(sys.argv[4]) if len(sys.argv) > 1 else 1
+    mapFunc = Counter
+    reduceFunc = Adder
+    partitionerFunc = ModuloFirstLetter
+
+    # if partitioner function is not provided
+    if(not partitionerFunc): partitionerFunc = DefaultPartitioner
+    
+    use_channel("tcp")
+
+    if(not exists(inputFile)):
+        raise IOError(inputFile & " not found")
+        return
+
+    inputSplits = getInputSplits(inputFile, inputSplitSize)  # input file is split in to number of splits and each split is processed by a Mapper worker
+
+
+    kvType = KeyValueType(str, int)
+    mapOutputDir = './MapOutput/'
+
+    mapWorkers = createprocs(MapWorker, nMapWorkers)  # map nodes for executing the map task
+    nodes = mapWorkers
+    for mapWorker in mapWorkers:
+        setupprocs([mapWorker], [kvType, mapFunc, mapOutputDir])
+
+
+    reduceWorkers = set()
+
+    master = createprocs(Master, 1)  # master node for executing the MapReduce framework
+    setupprocs(master, [mapWorkers, reduceWorkers, inputSplits, partitionerFunc])  # call to the setup method
+    # update - adds every element of the given 'set' to the calling 'set', add operation adds only one element
+    nodes.update(master)  # add the master node to the existing set of nodes
+
+    # start all the nodes
+    startprocs(nodes)
+
+#    # wait for the master node to join
+#    nodes.join()
+#
+#    # wait for all the nodes to join
+    for node in nodes:
+        node.join()

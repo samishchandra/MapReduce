@@ -1,0 +1,10 @@
+./TextFiles/File1.txt
+./TextFiles/File2.txt
+./TextFiles/File3.txt
+./TextFiles/File4.txt
+./TextFiles/File5.txt
+./TextFiles/File6.txt
+./TextFiles/File7.txt
+./TextFiles/File8.txt
+./TextFiles/File9.txt
+./TextFiles/File10.txt
